@@ -27,6 +27,7 @@ android {
         }
     }
     compileOptions {
+        // Use Java 11 for compatibility with newer Android Gradle Plugin versions
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
@@ -36,33 +37,28 @@ android {
 }
 
 dependencies {
-
+    // Standard AndroidX dependencies, assuming they are defined in libs.versions.toml
+    // If you don't have a libs.versions.toml, you will need to replace these with direct versions.
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.androidx.activity)
-    implementation(libs.androidx.constraintlayout)
+    implementation(libs.androidx.constraintlayout) // This is the ConstraintLayout dependency
+
+    // Specific dependencies for this project not typically in default libs.versions.toml
+    // Using the latest versions we've discussed
+    implementation("org.java-websocket:Java-WebSocket:1.5.4") // Latest version from your logs
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // Test dependencies, assuming they are defined in libs.versions.toml
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 
-        implementation ("androidx.core:core-ktx:1.10.1")
-        implementation ("androidx.appcompat:appcompat:1.6.1")
-        implementation ("com.google.android.material:material:1.9.0")
-
-        implementation ("androidx.media3:media3-exoplayer:1.1.0")
-        implementation ("androidx.media3:media3-ui:1.1.0")
-
-        implementation ("io.ktor:ktor-client-core:2.3.4")
-        implementation ("io.ktor:ktor-client-cio:2.3.4")
-        implementation ("io.ktor:ktor-client-websockets:2.3.4")
-
-        implementation ("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-    implementation("org.java-websocket:Java-WebSocket:1.5.2")
-    implementation("com.squareup.okhttp3:okhttp:4.9.3")
-    implementation("com.squareup.okhttp3:okhttp:4.11.0")
-    implementation("org.java-websocket:Java-WebSocket:1.5.4")
-
-
-
+    // Removed:
+    // - Duplicate and conflicting versions of core-ktx, appcompat, material, constraintlayout
+    // - media3-exoplayer and media3-ui (unless explicitly needed for other video playback)
+    // - ktor dependencies (unless explicitly needed for other network calls, not WebSockets here)
+    // - okhttp (Java-WebSocket handles its own underlying HTTP client)
 }
