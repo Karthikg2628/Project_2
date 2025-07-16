@@ -1,57 +1,86 @@
+// WebSocketServerManager.kt (Remote App)
 package com.example.remoteapp
 
-import android.content.Context
 import android.util.Log
-import org.java_websocket.client.WebSocketClient
-import org.java_websocket.handshake.ServerHandshake
-import java.net.URI
+import org.java_websocket.WebSocket
+import org.java_websocket.handshake.ClientHandshake
+import org.java_websocket.server.WebSocketServer
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicReference
 
-// This WebSocket client connects to the Origin app to receive video frames and commands.
-class RemoteWebSocketClient(
-    serverUri: URI,
-    private val context: Context, // Add context parameter
-    private val onOpen: () -> Unit,
-    private val onMessageString: (String) -> Unit, // For text messages
-    private val onMessageBytes: (ByteArray) -> Unit, // For binary (image) messages
-    private val onClose: (code: Int, reason: String?, remote: Boolean) -> Unit,
-    private val onError: (Exception) -> Unit // onError expects a non-null Exception
-) : WebSocketClient(serverUri) {
+class WebSocketServerManager(
+    port: Int,
+    private val listener: WebSocketServerListener?
+) : WebSocketServer(InetSocketAddress(port)) {
+
+    private val connectedClient = AtomicReference<WebSocket?>()
+
+    interface WebSocketServerListener {
+        fun onServerStarted()
+        fun onClientConnected(ipAddress: String)
+        fun onClientDisconnected(ipAddress: String, code: Int, reason: String)
+        fun onMessageReceived(message: ByteBuffer)
+        fun onCommandReceived(command: String)
+        fun onServerError(ex: Exception)
+    }
+
+    override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
+        conn?.let {
+            Log.d(TAG, "New connection from ${it.remoteSocketAddress?.address?.hostAddress}")
+            connectedClient.set(it)
+            listener?.onClientConnected(it.remoteSocketAddress?.address?.hostAddress ?: "Unknown")
+        }
+    }
+
+    override fun onClose(conn: WebSocket?, code: Int, reason: String?, remote: Boolean) {
+        conn?.let {
+            Log.d(TAG, "Closed ${it.remoteSocketAddress?.address?.hostAddress} with exit code $code additional info: $reason")
+            if (connectedClient.compareAndSet(it, null)) { // Only clear if it's the current client
+                listener?.onClientDisconnected(it.remoteSocketAddress?.address?.hostAddress ?: "Unknown", code, reason ?: "No reason")
+            }
+        }
+    }
+
+    override fun onMessage(conn: WebSocket?, message: String?) {
+        conn?.let {
+            message?.let { msg ->
+                Log.d(TAG, "Received text from ${it.remoteSocketAddress?.address?.hostAddress}: $msg")
+                listener?.onCommandReceived(msg) // Assuming text messages are commands
+            }
+        }
+    }
+
+    override fun onMessage(conn: WebSocket?, message: ByteBuffer?) {
+        conn?.let {
+            message?.let { bytes ->
+                Log.d(TAG, "Received binary from ${it.remoteSocketAddress?.address?.hostAddress}: ${bytes.remaining()} bytes")
+                listener?.onMessageReceived(bytes)
+            }
+        }
+    }
+
+    override fun onError(conn: WebSocket?, ex: Exception?) {
+        Log.e(TAG, "An error occurred on connection ${conn?.remoteSocketAddress ?: "null"}: ${ex?.message}", ex)
+        ex?.let { listener?.onServerError(it) }
+    }
+
+    override fun onStart() {
+        Log.d(TAG, "Server started on port $port")
+        connectionLostTimeout = 100 // Set a small timeout for more active monitoring
+        listener?.onServerStarted()
+    }
+
+    fun stopServer() {
+        runCatching {
+            stop()
+            Log.d(TAG, "WebSocket server stopped.")
+        }.onFailure { e ->
+            Log.e(TAG, "Error stopping WebSocket server", e)
+        }
+    }
 
     companion object {
-        private const val TAG = "RemoteWSC"
-    }
-
-    override fun onOpen(handshakedata: ServerHandshake?) {
-        Log.d(TAG, "Connected to server: ${uri.host}:${uri.port}")
-        onOpen.invoke()
-    }
-
-    override fun onMessage(message: String?) {
-        message?.let {
-            Log.d(TAG, "Received text message: $it")
-            onMessageString.invoke(it) // Invoke the specific text message callback
-        }
-    }
-
-    override fun onMessage(bytes: ByteBuffer?) {
-        bytes?.let {
-            val byteArray = ByteArray(it.remaining())
-            it.get(byteArray)
-            Log.d(TAG, "Received binary message of size: ${byteArray.size} bytes")
-            onMessageBytes.invoke(byteArray) // Invoke the specific binary message callback
-        }
-    }
-
-    override fun onClose(code: Int, reason: String?, remote: Boolean) {
-        Log.d(TAG, "Disconnected from server. Code: $code, Reason: $reason, Remote: $remote")
-        onClose.invoke(code, reason, remote)
-    }
-
-    // Explicitly handle a potentially null 'ex' before passing it to onError
-    override fun onError(ex: Exception?) {
-        val actualException = ex ?: Exception("Unknown WebSocket error occurred.")
-        Log.e(TAG, "WebSocket Error: ${actualException.message}", actualException)
-        onError.invoke(actualException) // Pass a guaranteed non-null Exception
+        private const val TAG = "WSServer"
     }
 }
