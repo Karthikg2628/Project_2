@@ -1,210 +1,285 @@
-// MainActivity.kt (Remote App)
 package com.example.remoteapp
 
-import android.content.Context
-import android.graphics.PixelFormat
-import android.media.MediaFormat
+import android.content.pm.ActivityInfo
+import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import java.net.InetAddress
-import java.net.NetworkInterface
-import java.net.SocketException
+import androidx.lifecycle.lifecycleScope // Import for lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
-import java.util.Enumeration
+import java.util.concurrent.Executors // Still used for UI updates if you prefer, or replace with coroutines
 
-class MainActivity : AppCompatActivity(), SurfaceHolder.Callback,
-    WebSocketServerManager.WebSocketServerListener {
+class MainActivity : AppCompatActivity(), WebSocketServerListener, SurfaceHolder.Callback {
 
-    private lateinit var surfaceView: SurfaceView
-    private lateinit var statusTextView: TextView
     private lateinit var ipAddressTextView: TextView
-
-    private var wsServer: WebSocketServerManager? = null
+    private lateinit var statusTextView: TextView
+    private lateinit var videoSurfaceView: SurfaceView
+    private lateinit var wsServer: WebSocketServerManager
     private var mediaPlaybackManager: MediaPlaybackManager? = null
-    private val WEBSOCKET_PORT = 8080 // Or configurable
 
-    // These will be populated by CSD from Origin
-    private var receivedVideoFormat: MediaFormat? = null
-    private var receivedAudioFormat: MediaFormat? = null
+    // Ensure only one thread for UI updates to avoid conflicts.
+    // While coroutines could also handle this, keeping the existing executor
+    // if you prefer explicit separation, but a simple launch(Dispatchers.Main) would suffice.
+    private val uiUpdateExecutor = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main) // You'll need to create this layout
+        setContentView(R.layout.activity_main)
 
-        surfaceView = findViewById(R.id.videoSurfaceView)
+        // Force landscape orientation for video playback
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+
+        ipAddressTextView = findViewById(R.id.ipAddressTextView)
         statusTextView = findViewById(R.id.statusTextView)
-        ipAddressTextView = findViewById(R.id.statusTextView)
+        videoSurfaceView = findViewById(R.id.videoSurfaceView)
+        val localIpEditText: TextView = findViewById(R.id.ipAddressEditText)
 
-        surfaceView.holder.addCallback(this)
-        surfaceView.holder.setFormat(PixelFormat.RGBA_8888) // Ensure surface is ready for video rendering
+        videoSurfaceView.holder.addCallback(this)
 
-        startWebSocketServer()
-        displayLocalIpAddress()
-    }
-
-    private fun startWebSocketServer() {
-        wsServer = WebSocketServerManager(WEBSOCKET_PORT, this).apply {
-            start() // This starts the server in a new thread
+        // Display local IP address to connect to. This can be run on IO dispatcher
+        // if Utils.getLocalIpAddress is potentially blocking (e.g., involves network calls).
+        // For simple local IP lookup, it's usually fast enough, but moving it is safer.
+        lifecycleScope.launch(Dispatchers.IO) {
+            val localIp = Utils.getLocalIpAddress(this@MainActivity)
+            withContext(Dispatchers.Main) {
+                localIpEditText.text = localIp
+                Log.d(TAG, "Local IP Address: $localIp")
+            }
         }
-    }
 
-    private fun displayLocalIpAddress() {
-        val ip = getLocalIpAddress()
-        ipAddressTextView.text = "Remote IP: $ip:$WEBSOCKET_PORT"
-    }
+        // Initialize WebSocket server. Start it in a background coroutine
+        // to prevent blocking the main thread during initialization.
+        wsServer = WebSocketServerManager(8080, this)
+        updateStatus("Server initializing...", Color.GRAY)
 
-    // Helper to get local IP address
-    private fun getLocalIpAddress(): String {
-        try {
-            val interfaces: Enumeration<NetworkInterface> = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val intf: NetworkInterface = interfaces.nextElement()
-                val addresses: Enumeration<InetAddress> = intf.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr: InetAddress = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr.isSiteLocalAddress) {
-                        return addr.hostAddress
-                    }
+        // Launch server startup in a coroutine on the IO dispatcher
+        // This is the key change for "Skipped frames!"
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                wsServer.start()
+                withContext(Dispatchers.Main) {
+                    updateStatus("Server started. Waiting for Origin connection...", Color.BLUE)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start WebSocket server", e)
+                withContext(Dispatchers.Main) {
+                    updateStatus("Server failed to start: ${e.message}", Color.RED)
+                    Toast.makeText(this@MainActivity, "Server error: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
-        } catch (ex: SocketException) {
-            Log.e(TAG, "Error getting IP address: ${ex.message}", ex)
         }
-        return "N/A"
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        wsServer?.stopServer()
-        mediaPlaybackManager?.stopPlayback()
+        Log.d(TAG, "onDestroy called. Stopping server and media playback.")
+        // It's good practice to stop these on a background thread if they might block
+        // during shutdown, though for simple stop/release, it's often fine on main.
+        lifecycleScope.launch(Dispatchers.IO) {
+            wsServer.stopServer() // Ensure this properly closes all sockets
+            Log.d(TAG, "WebSocket server stopped.")
+            mediaPlaybackManager?.stopPlayback()
+            Log.d(TAG, "Media playback stopped.")
+        }
+        uiUpdateExecutor.shutdownNow() // Shut down the executor for UI updates
     }
 
-    // --- SurfaceHolder.Callback methods ---
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        Log.d(TAG, "Surface created.")
-        // Initialize MediaPlaybackManager here, but don't start playback yet
-        mediaPlaybackManager = MediaPlaybackManager(holder.surface)
-    }
+    // --- WebSocketServerListener Implementation ---
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        Log.d(TAG, "Surface changed: ${width}x${height}")
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.d(TAG, "Surface destroyed.")
-        mediaPlaybackManager?.stopPlayback() // Crucial for ephemeral data and resource release
-    }
-
-    // --- WebSocketServerManager.WebSocketServerListener methods ---
+    // onServerStarted will now be called by the WS server implementation itself
+    // after it successfully starts. The updateStatus call is already done in onCreate.
+    // No change needed here, as the initial status update is handled above.
     override fun onServerStarted() {
-        runOnUiThread { statusTextView.text = "Waiting for Origin..." }
+        // This callback is triggered by WebSocketServerManager when it's internally ready.
+        // The UI update for "Server started" is handled above in the onCreate coroutine.
     }
 
     override fun onClientConnected(ipAddress: String) {
-        runOnUiThread { statusTextView.text = "Origin Connected: $ipAddress" }
-        // Reset formats for new connection
-        receivedVideoFormat = null
-        receivedAudioFormat = null
+        // All UI updates are already correctly delegated to runOnUiThread/uiUpdateExecutor.
+        updateStatus("Client Connected: $ipAddress. Waiting for stream...", Color.CYAN)
+        // No need for runOnUiThread here as updateStatus already does it.
+        // It's crucial that mediaPlaybackManager is not null here.
+        mediaPlaybackManager?.startPlayback()
     }
 
     override fun onClientDisconnected(ipAddress: String, code: Int, reason: String) {
-        runOnUiThread {
-            statusTextView.text = "Origin Disconnected. Reason: $reason"
-            mediaPlaybackManager?.stopPlayback() // Crucial for ephemeral data
+        updateStatus("Client Disconnected: $ipAddress ($reason)", Color.RED)
+        // No need for runOnUiThread here as updateStatus already does it.
+        lifecycleScope.launch(Dispatchers.Main) { // Ensure UI update happens on Main thread
+            ipAddressTextView.text = "Origin IP: N/A"
         }
+        mediaPlaybackManager?.stopPlayback() // Stop playback when client disconnects
     }
 
     override fun onMessageReceived(message: ByteBuffer) {
-        // Parse the incoming binary message
-        if (!message.hasRemaining()) {
-            Log.w(TAG, "Received empty buffer.")
+        // Data processing for ByteBuffer needs to be efficient.
+        // These operations are usually fast enough not to block, as they just read from buffer.
+        // The actual media decoding happens on MediaPlaybackManager's internal threads.
+
+        // Ensure the buffer is reset for reading each time
+        message.rewind()
+        if (message.remaining() < 1) {
+            Log.e(TAG, "Received empty or too short binary message.")
             return
         }
 
-        val type = message.get() // Read 1-byte type
-        val ptsUs = message.long // Read 8-byte PTS
-        val data = message.slice() // Remaining data is the encoded media
+        val packetType = message.get() // Read the first byte as packet type
 
-        when (type) {
-            MediaPlaybackManager.PACKET_TYPE_VIDEO_CSD -> {
-                Log.d(TAG, "Received Video CSD, PTS: $ptsUs, Size: ${data.remaining()}")
-                // This is simplified. For H.264, ptsUs 0 might be SPS, ptsUs 1 might be PPS.
-                // You need to reconstruct the MediaFormat from these.
-                if (receivedVideoFormat == null) {
-                    // Placeholder values. Actual resolution/MIME should be inferred or sent.
-                    // For H.264, createVideoFormat needs width/height, but CSD often doesn't contain it.
-                    // A more robust solution might send resolution as part of initial handshake.
-                    // For now, assume common 1080p, you'll need to adapt.
-                    receivedVideoFormat = MediaFormat.createVideoFormat("video/avc", 1920, 1080)
+        when (packetType) {
+            Constants.PACKET_TYPE_VIDEO -> {
+                if (message.remaining() < 8) { // For presentationTimeUs (long)
+                    Log.e(TAG, "Video packet too short for PTS.")
+                    return
                 }
-                if (ptsUs == 0L) { // Assuming PTS 0 for SPS (csd-0)
-                    receivedVideoFormat?.setByteBuffer("csd-0", data)
-                } else if (ptsUs == 1L) { // Assuming PTS 1 for PPS (csd-1)
-                    receivedVideoFormat?.setByteBuffer("csd-1", data)
-                }
-
-                // If both SPS and PPS are received, and audio format is also ready, then set media formats
-                if (receivedVideoFormat?.getByteBuffer("csd-0") != null &&
-                    receivedVideoFormat?.getByteBuffer("csd-1") != null &&
-                    receivedAudioFormat != null && mediaPlaybackManager != null
-                ) {
-                    mediaPlaybackManager?.setMediaFormats(receivedVideoFormat, receivedAudioFormat)
-                }
+                val presentationTimeUs = message.getLong()
+                val videoData = message.slice() // Data from current position to limit
+                mediaPlaybackManager?.addVideoPacket(MediaPacket(packetType, presentationTimeUs, videoData))
             }
-            MediaPlaybackManager.PACKET_TYPE_AUDIO_CSD -> {
-                Log.d(TAG, "Received Audio CSD, PTS: $ptsUs, Size: ${data.remaining()}")
-                // For AAC, create the AudioFormat and add the CSD
-                // Placeholder values. Actual sample rate/channels should be inferred or sent.
-                receivedAudioFormat = MediaFormat.createAudioFormat("audio/mp4a-latm", 44100, 2)
-                receivedAudioFormat?.setByteBuffer("csd-0", data) // AudioSpecificConfig for AAC
-
-                // If video format is also ready, then set media formats
-                if (receivedVideoFormat != null && receivedAudioFormat != null && mediaPlaybackManager != null) {
-                    mediaPlaybackManager?.setMediaFormats(receivedVideoFormat, receivedAudioFormat)
+            Constants.PACKET_TYPE_AUDIO -> {
+                if (message.remaining() < 8) { // For presentationTimeUs (long)
+                    Log.e(TAG, "Audio packet too short for PTS.")
+                    return
                 }
+                val presentationTimeUs = message.getLong()
+                val audioData = message.slice() // Data from current position to limit
+                mediaPlaybackManager?.addAudioPacket(MediaPacket(packetType, presentationTimeUs, audioData))
+            }
+            Constants.PACKET_TYPE_VIDEO_CSD -> {
+                if (message.remaining() < 4) { // For csdDataLength (int)
+                    Log.e(TAG, "Video CSD packet too short for length.")
+                    return
+                }
+                val csdDataLength = message.getInt()
+                if (message.remaining() < csdDataLength) {
+                    Log.e(TAG, "Video CSD packet data too short, expected $csdDataLength, got ${message.remaining()}")
+                    return
+                }
+                val csdData = message.slice() // Data from current position to limit
+                mediaPlaybackManager?.setVideoCSD(csdData)
+            }
+            Constants.PACKET_TYPE_AUDIO_CSD -> {
+                if (message.remaining() < 4) { // For csdDataLength (int)
+                    Log.e(TAG, "Audio CSD packet too short for length.")
+                    return
+                }
+                val csdDataLength = message.getInt()
+                if (message.remaining() < csdDataLength) {
+                    Log.e(TAG, "Audio CSD packet data too short, expected $csdDataLength, got ${message.remaining()}")
+                    return
+                }
+                val csdData = message.slice() // Data from current position to limit
+                mediaPlaybackManager?.setAudioCSD(csdData)
+            }
+            Constants.PACKET_TYPE_VIDEO_FORMAT_DATA -> {
+                if (message.remaining() < 4) { // For mimeLength (int)
+                    Log.e(TAG, "Video format packet too short for mime length.")
+                    return
+                }
+                val mimeLength = message.getInt()
+                // Check if enough bytes remain for mime, width, height, and frameRate
+                if (message.remaining() < mimeLength + 4 + 4 + 4) {
+                    Log.e(TAG, "Video format packet data too short after mime length, expected at least ${mimeLength + 12}, got ${message.remaining()}")
+                    return
+                }
+                val mimeBytes = ByteArray(mimeLength)
+                message.get(mimeBytes)
+                val mime = String(mimeBytes, Charsets.UTF_8)
+                val width = message.getInt()
+                val height = message.getInt()
+                val frameRate = message.getInt()
+                mediaPlaybackManager?.setVideoFormat(mime, width, height, frameRate)
+            }
+            Constants.PACKET_TYPE_AUDIO_FORMAT_DATA -> {
+                if (message.remaining() < 4) { // For mimeLength (int)
+                    Log.e(TAG, "Audio format packet too short for mime length.")
+                    return
+                }
+                val mimeLength = message.getInt()
+                // Check if enough bytes remain for mime, sampleRate, and channelCount
+                if (message.remaining() < mimeLength + 4 + 4) {
+                    Log.e(TAG, "Audio format packet data too short after mime length, expected at least ${mimeLength + 8}, got ${message.remaining()}")
+                    return
+                }
+                val mimeBytes = ByteArray(mimeLength)
+                message.get(mimeBytes)
+                val mime = String(mimeBytes, Charsets.UTF_8)
+                val sampleRate = message.getInt()
+                val channelCount = message.getInt()
+                mediaPlaybackManager?.setAudioFormat(mime, sampleRate, channelCount)
             }
             else -> {
-                if (mediaPlaybackManager != null && mediaPlaybackManager?.isPlaying?.get() == true) {
-                    mediaPlaybackManager?.addPacket(type, ptsUs, data)
-                }
+                Log.w(TAG, "Received unknown packet type: $packetType")
             }
         }
     }
 
     override fun onCommandReceived(command: String) {
-        runOnUiThread {
-            Log.d(TAG, "Received command: $command")
-            when (command) {
-                MediaPlaybackManager.COMMAND_START_STREAMING -> { // Corrected: Reference from MediaPlaybackManager
-                    if (mediaPlaybackManager != null) {
-                        mediaPlaybackManager?.startPlayback()
-                        statusTextView.text = "Streaming..."
-                    } else {
-                        Log.e(TAG, "MediaPlaybackManager not initialized when START_STREAMING received.")
-                    }
-                }
-                MediaPlaybackManager.COMMAND_STOP_STREAMING -> { // Corrected: Reference from MediaPlaybackManager
-                    if (mediaPlaybackManager != null) {
-                        mediaPlaybackManager?.stopPlayback()
-                        statusTextView.text = "Stream Stopped by Origin."
-                    }
+        Log.d(TAG, "Received command: $command")
+        when (command) {
+            Constants.COMMAND_START_STREAMING -> {
+                updateStatus("Streaming Started!", Color.GREEN)
+                mediaPlaybackManager?.startPlayback() // Ensure playback starts/resumes
+            }
+            Constants.COMMAND_STOP_STREAMING -> {
+                updateStatus("Streaming Stopped.", Color.BLACK)
+                mediaPlaybackManager?.stopPlayback() // Stop playback
+            }
+            else -> {
+                Log.w(TAG, "Unknown command received: $command")
+                lifecycleScope.launch(Dispatchers.Main) { // Show Toast on Main thread
+                    Toast.makeText(this@MainActivity, "Unknown command: $command", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
 
     override fun onServerError(ex: Exception) {
-        runOnUiThread {
-            statusTextView.text = "Server Error: ${ex.message}"
-            Log.e(TAG, "WebSocket Server Error", ex)
+        updateStatus("Server Error: ${ex.message}", Color.RED)
+        Log.e(TAG, "WebSocket Server Error", ex)
+    }
+
+    // --- SurfaceHolder.Callback Implementation ---
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        Log.d(TAG, "Surface created. Initializing MediaPlaybackManager.")
+        // Initialize MediaPlaybackManager here as Surface is ready
+        mediaPlaybackManager = MediaPlaybackManager(holder.surface)
+        // Playback will be started by onClientConnected or onCommandReceived.
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        Log.d(TAG, "Surface changed: $width x $height")
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        Log.d(TAG, "Surface destroyed. Stopping MediaPlaybackManager.")
+        mediaPlaybackManager?.stopPlayback() // Stop playback cleanly
+        mediaPlaybackManager = null // Clear reference
+    }
+
+    // --- UI Update Helper ---
+
+    private fun updateStatus(message: String, color: Int) {
+        // Use the single-thread executor to enqueue UI updates.
+        // Alternatively, you could directly use lifecycleScope.launch(Dispatchers.Main)
+        // for all UI updates, potentially simplifying the threading.
+        uiUpdateExecutor.execute {
+            runOnUiThread {
+                statusTextView.text = "Status: $message"
+                statusTextView.setTextColor(color)
+            }
         }
     }
 
     companion object {
-        private const val TAG = "RemoteApp"
+        private const val TAG = "MainActivityRemote"
     }
 }
